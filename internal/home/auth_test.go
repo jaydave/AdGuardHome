@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -20,21 +19,6 @@ import (
 
 func TestMain(m *testing.M) {
 	aghtest.DiscardLogOutput(m)
-}
-
-func prepareTestDir(t *testing.T) string {
-	t.Helper()
-
-	const dir = "./agh-test"
-
-	require.Nil(t, os.RemoveAll(dir))
-	// TODO(e.burkov): Replace with testing.TempDir after updating Go
-	// version to 1.16.
-	require.Nil(t, os.MkdirAll(dir, 0o755))
-
-	t.Cleanup(func() { require.Nil(t, os.RemoveAll(dir)) })
-
-	return dir
 }
 
 func TestNewSessionToken(t *testing.T) {
@@ -57,14 +41,14 @@ func TestNewSessionToken(t *testing.T) {
 }
 
 func TestAuth(t *testing.T) {
-	dir := prepareTestDir(t)
+	dir := t.TempDir()
 	fn := filepath.Join(dir, "sessions.db")
 
 	users := []User{{
 		Name:         "name",
 		PasswordHash: "$2y$05$..vyzAECIhJPfaQiOK17IukcQnqEgKJHy0iETyYqxn3YXJl8yZuo2",
 	}}
-	a := InitAuth(fn, nil, 60)
+	a := InitAuth(fn, nil, 60, nil)
 	s := session{}
 
 	user := User{Name: "name"}
@@ -92,7 +76,7 @@ func TestAuth(t *testing.T) {
 	a.Close()
 
 	// load saved session
-	a = InitAuth(fn, users, 60)
+	a = InitAuth(fn, users, 60, nil)
 
 	// the session is still alive
 	assert.Equal(t, checkSessionOK, a.checkSession(sessStr))
@@ -107,7 +91,7 @@ func TestAuth(t *testing.T) {
 	time.Sleep(3 * time.Second)
 
 	// load and remove expired sessions
-	a = InitAuth(fn, users, 60)
+	a = InitAuth(fn, users, 60, nil)
 	assert.Equal(t, checkSessionNotFound, a.checkSession(sessStr))
 
 	a.Close()
@@ -132,13 +116,13 @@ func (w *testResponseWriter) WriteHeader(statusCode int) {
 }
 
 func TestAuthHTTP(t *testing.T) {
-	dir := prepareTestDir(t)
+	dir := t.TempDir()
 	fn := filepath.Join(dir, "sessions.db")
 
 	users := []User{
 		{Name: "name", PasswordHash: "$2y$05$..vyzAECIhJPfaQiOK17IukcQnqEgKJHy0iETyYqxn3YXJl8yZuo2"},
 	}
-	Context.auth = InitAuth(fn, users, 60)
+	Context.auth = InitAuth(fn, users, 60, nil)
 
 	handlerCalled := false
 	handler := func(_ http.ResponseWriter, _ *http.Request) {
@@ -167,7 +151,7 @@ func TestAuthHTTP(t *testing.T) {
 	assert.True(t, handlerCalled)
 
 	// perform login
-	cookie, err := Context.auth.httpCookie(loginJSON{Name: "name", Password: "password"})
+	cookie, err := Context.auth.httpCookie(loginJSON{Name: "name", Password: "password"}, "")
 	assert.Nil(t, err)
 	assert.NotEmpty(t, cookie)
 
