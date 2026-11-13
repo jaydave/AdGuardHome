@@ -1,19 +1,17 @@
-// +build windows
+//go:build windows
 
 package aghos
 
 import (
-	"fmt"
-	"syscall"
+	"os"
+	"path/filepath"
 
+	"github.com/AdguardTeam/golibs/errors"
 	"golang.org/x/sys/windows"
 )
 
-func canBindPrivilegedPorts() (can bool, err error) {
-	return HaveAdminRights()
-}
-
-func setRlimit(val uint) {
+func setRlimit(_ uint64) (err error) {
+	return Unsupported("setrlimit")
 }
 
 func haveAdminRights() (bool, error) {
@@ -23,11 +21,11 @@ func haveAdminRights() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	defer func() { err = errors.WithDeferred(err, token.Close()) }()
 
 	info := make([]byte, 4)
 	var returnedLen uint32
 	err = windows.GetTokenInformation(token, windows.TokenElevation, &info[0], uint32(len(info)), &returnedLen)
-	token.Close()
 	if err != nil {
 		return false, err
 	}
@@ -37,10 +35,21 @@ func haveAdminRights() (bool, error) {
 	return true, nil
 }
 
-func sendProcessSignal(pid int, sig syscall.Signal) error {
-	return fmt.Errorf("not supported on Windows")
-}
-
 func isOpenWrt() (ok bool) {
 	return false
+}
+
+func sendShutdownSignal(c chan<- os.Signal) {
+	c <- os.Interrupt
+}
+
+func rootDir() (dir string) {
+	// TODO(e.burkov): Use a better way if golang/go#44279 is ever resolved.
+	sysDir, err := windows.GetSystemDirectory()
+	if err != nil {
+		// Assume that C:\ is the safe default.
+		return `C:\`
+	}
+
+	return filepath.Join(filepath.VolumeName(sysDir), `\`)
 }

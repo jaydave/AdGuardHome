@@ -1,0 +1,48 @@
+.section {
+    padding: 8px 16px;
+    width: 100%;
+}
+
+.fieldGroup {
+    width: 100%;
+}
+
+.fieldGroupInput {
+    padding: 16px;
+    width: 100%;
+}
+
+.fieldLabel {
+    color: var(--default-main-text);
+    margin-bottom: 4px;
+}
+
+.fieldDesc {
+    color: var(--default-description-text);
+    margin-bottom: 12px;
+
+    a {
+        color: var(--default-link);
+    }
+}
+
+.actions {
+    display: flex;
+    gap: 16px;
+    padding: 16px;
+    flex-direction: column;
+
+    @media (min-width: 768px) {
+        flex-direction: row;
+    }
+}
+
+.actionButton {
+    width: auto;
+    min-width: 200px;
+    max-width: 100%;
+}
+
+.containerOverride {
+    padding-top: 0;
+}

@@ -1,5 +1,0 @@
----
-!include test.yaml
-
----
-!include release.yaml

@@ -1,49 +1,90 @@
 package home
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"strings"
+	"uuid"
 
-	"github.com/AdguardTeam/AdGuardHome/internal/dnsforward"
-	"github.com/AdguardTeam/golibs/log"
-	uuid "github.com/satori/go.uuid"
+	"github.com/AdguardTeam/AdGuardHome/internal/client"
+	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/httphdr"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/netutil/urlutil"
 	"howett.net/plist"
 )
 
+// dnsSettings is the DNSSetting.DNSSettings mobileconfig profile.
+//
+// See https://developer.apple.com/documentation/devicemanagement/dnssettings/dnssettings.
 type dnsSettings struct {
+	// DNSProtocol is the required protocol to be used.  The valid values
+	// are "HTTPS" and "TLS".
 	DNSProtocol string
-	ServerURL   string `plist:",omitempty"`
-	ServerName  string `plist:",omitempty"`
-	clientID    string
+
+	// ServerURL is the URI template of the DoH server.  It must be empty if
+	// DNSProtocol is not "HTTPS".
+	ServerURL string `plist:",omitempty"`
+
+	// ServerName is the hostname of the DoT server.  It must be empty if
+	// DNSProtocol is not "TLS".
+	ServerName string `plist:",omitempty"`
+
+	// ServerAddresses is a list IP addresses of the server.
+	//
+	// TODO(a.garipov): Allow users to set this.
+	//
+	// See https://github.com/AdguardTeam/AdGuardHome/issues/3607.
+	ServerAddresses []net.IP `plist:",omitempty"`
 }
 
+// payloadContent is a Device Management Profile payload.
+//
+// See https://developer.apple.com/documentation/devicemanagement/configuring_multiple_devices_using_profiles#3234127.
 type payloadContent struct {
-	Name               string
-	PayloadDescription string
-	PayloadDisplayName string
-	PayloadIdentifier  string
+	DNSSettings *dnsSettings
+
+	OnDemandEnabled int
+	OnDemandRules   []*onDemandRule
+
 	PayloadType        string
+	PayloadIdentifier  string
+	PayloadDisplayName string
+	PayloadDescription string
 	PayloadUUID        string
-	DNSSettings        dnsSettings
 	PayloadVersion     int
 }
 
+// onDemandRule determines which queries use the DNS server.
+//
+// See https://developer.apple.com/documentation/devicemanagement/dnssettings/ondemandruleselement.
+type onDemandRule struct {
+	Action string
+}
+
+// dnsSettingsPayloadType is the payload type for a DNSSettings profile.
+const dnsSettingsPayloadType = "com.apple.dnsSettings.managed"
+
+// mobileConfig contains the TopLevel properties for configuring Device
+// Management Profiles.
+//
+// See https://developer.apple.com/documentation/devicemanagement/toplevel.
 type mobileConfig struct {
 	PayloadDescription       string
 	PayloadDisplayName       string
-	PayloadIdentifier        string
 	PayloadType              string
+	PayloadContent           []*payloadContent
+	PayloadIdentifier        string
 	PayloadUUID              string
-	PayloadContent           []payloadContent
 	PayloadVersion           int
 	PayloadRemovalDisallowed bool
-}
-
-func genUUIDv4() string {
-	return uuid.NewV4().String()
+	PayloadScope             string
 }
 
 const (
@@ -51,108 +92,136 @@ const (
 	dnsProtoTLS   = "TLS"
 )
 
-func getMobileConfig(d dnsSettings) ([]byte, error) {
+// mobileConfigHandlerConfig is the configuration structure for
+// [newMobileConfigHandler].
+type mobileConfigHandlerConfig struct {
+	// logger is used for logging the operations of mobile config handler.  It
+	// must not be nil.
+	logger *slog.Logger
+}
+
+// mobileConfigHandler handles mobile-config related operations.
+type mobileConfigHandler struct {
+	logger *slog.Logger
+}
+
+// newMobileConfigHandler creates a new instance of [*mobileConfigHandler].  c
+// must not be nil and must be valid.
+func newMobileConfigHandler(c *mobileConfigHandlerConfig) *mobileConfigHandler {
+	return &mobileConfigHandler{
+		logger: c.logger.With(slogutil.KeyPrefix, "mobile_handler"),
+	}
+}
+
+func encodeMobileConfig(d *dnsSettings, clientID string) ([]byte, error) {
 	var dspName string
-	switch d.DNSProtocol {
+	switch proto := d.DNSProtocol; proto {
 	case dnsProtoHTTPS:
 		dspName = fmt.Sprintf("%s DoH", d.ServerName)
-
 		u := &url.URL{
-			Scheme: schemeHTTPS,
+			Scheme: urlutil.SchemeHTTPS,
 			Host:   d.ServerName,
-			Path:   "/dns-query",
+			Path:   path.Join("/dns-query", clientID),
 		}
-		if d.clientID != "" {
-			u.Path = path.Join(u.Path, d.clientID)
-		}
-
 		d.ServerURL = u.String()
+
+		// Empty the ServerName field since it is only must be presented
+		// in DNS-over-TLS configuration.
+		d.ServerName = ""
 	case dnsProtoTLS:
 		dspName = fmt.Sprintf("%s DoT", d.ServerName)
-		if d.clientID != "" {
-			d.ServerName = d.clientID + "." + d.ServerName
+		if clientID != "" {
+			d.ServerName = clientID + "." + d.ServerName
 		}
 	default:
-		return nil, fmt.Errorf("bad dns protocol %q", d.DNSProtocol)
+		return nil, fmt.Errorf("bad dns protocol %q", proto)
 	}
 
-	data := mobileConfig{
-		PayloadContent: []payloadContent{{
-			Name:               dspName,
-			PayloadDescription: "Configures device to use AdGuard Home",
+	payloadID := fmt.Sprintf("%s.%s", dnsSettingsPayloadType, uuid.New())
+	data := &mobileConfig{
+		PayloadDescription: "Adds AdGuard Home to macOS Big Sur and iOS 14 or newer systems",
+		PayloadDisplayName: dspName,
+		PayloadType:        "Configuration",
+		PayloadScope:       "System",
+		PayloadContent: []*payloadContent{{
+			DNSSettings:     d,
+			OnDemandEnabled: 1,
+			OnDemandRules: []*onDemandRule{{
+				Action: "Connect",
+			}},
+			PayloadType:        dnsSettingsPayloadType,
+			PayloadIdentifier:  payloadID,
 			PayloadDisplayName: dspName,
-			PayloadIdentifier:  fmt.Sprintf("com.apple.dnsSettings.managed.%s", genUUIDv4()),
-			PayloadType:        "com.apple.dnsSettings.managed",
-			PayloadUUID:        genUUIDv4(),
+			PayloadDescription: "Configures device to use AdGuard Home",
+			PayloadUUID:        strings.ToUpper(uuid.New().String()),
 			PayloadVersion:     1,
-			DNSSettings:        d,
 		}},
-		PayloadDescription:       "Adds AdGuard Home to Big Sur and iOS 14 or newer systems",
-		PayloadDisplayName:       dspName,
-		PayloadIdentifier:        genUUIDv4(),
-		PayloadRemovalDisallowed: false,
-		PayloadType:              "Configuration",
-		PayloadUUID:              genUUIDv4(),
+		PayloadIdentifier:        strings.ToUpper(uuid.New().String()),
+		PayloadUUID:              strings.ToUpper(uuid.New().String()),
 		PayloadVersion:           1,
+		PayloadRemovalDisallowed: false,
 	}
 
 	return plist.MarshalIndent(data, plist.XMLFormat, "\t")
 }
 
-func handleMobileConfig(w http.ResponseWriter, r *http.Request, dnsp string) {
+// respondJSONError writes an internal server error to the header and responds
+// to the client with an error.  l and w must not be nil.
+func respondJSONError(
+	ctx context.Context,
+	l *slog.Logger,
+	w http.ResponseWriter,
+	status int,
+	msg string,
+) {
+	w.WriteHeader(http.StatusInternalServerError)
+	err := json.NewEncoder(w).Encode(&jsonError{
+		Message: msg,
+	})
+	if err != nil {
+		l.DebugContext(ctx, "writing json response", "status", status, slogutil.KeyError, err)
+	}
+}
+
+// errEmptyHost error indicates that the host and server names are missing from
+// the query parameters.
+const errEmptyHost errors.Error = "no host in query parameters and no server_name"
+
+func (m *mobileConfigHandler) handleMobileConfig(w http.ResponseWriter, r *http.Request, dnsp string) {
 	var err error
 
+	ctx := r.Context()
 	q := r.URL.Query()
 	host := q.Get("host")
 	if host == "" {
-		host = Context.tls.conf.ServerName
-	}
-
-	if host == "" {
-		w.WriteHeader(http.StatusInternalServerError)
-
-		const msg = "no host in query parameters and no server_name"
-		err = json.NewEncoder(w).Encode(&jsonError{
-			Message: msg,
-		})
-		if err != nil {
-			log.Debug("writing 500 json response: %s", err)
-		}
+		respondJSONError(ctx, m.logger, w, http.StatusInternalServerError, string(errEmptyHost))
 
 		return
 	}
 
 	clientID := q.Get("client_id")
 	if clientID != "" {
-		err = dnsforward.ValidateClientID(clientID)
+		err = client.ValidateClientID(clientID)
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-
-			err = json.NewEncoder(w).Encode(&jsonError{
-				Message: err.Error(),
-			})
-			if err != nil {
-				log.Debug("writing 400 json response: %s", err)
-			}
+			respondJSONError(ctx, m.logger, w, http.StatusBadRequest, err.Error())
 
 			return
 		}
 	}
 
-	d := dnsSettings{
+	d := &dnsSettings{
 		DNSProtocol: dnsp,
 		ServerName:  host,
-		clientID:    clientID,
 	}
 
-	mobileconfig, err := getMobileConfig(d)
+	mobileconfig, err := encodeMobileConfig(d, clientID)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "plist.MarshalIndent: %s", err)
+		respondJSONError(ctx, m.logger, w, http.StatusInternalServerError, err.Error())
 
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/xml")
+	w.Header().Set(httphdr.ContentType, "application/xml")
 
 	const (
 		dohContDisp = `attachment; filename=doh.mobileconfig`
@@ -164,15 +233,17 @@ func handleMobileConfig(w http.ResponseWriter, r *http.Request, dnsp string) {
 		contDisp = dotContDisp
 	}
 
-	w.Header().Set("Content-Disposition", contDisp)
+	w.Header().Set(httphdr.ContentDisposition, contDisp)
 
 	_, _ = w.Write(mobileconfig)
 }
 
-func handleMobileConfigDOH(w http.ResponseWriter, r *http.Request) {
-	handleMobileConfig(w, r, dnsProtoHTTPS)
+// handleMobileConfigDoH handles getting DNS-over-HTTPS .mobileconfig.
+func (m *mobileConfigHandler) handleMobileConfigDoH(w http.ResponseWriter, r *http.Request) {
+	m.handleMobileConfig(w, r, dnsProtoHTTPS)
 }
 
-func handleMobileConfigDOT(w http.ResponseWriter, r *http.Request) {
-	handleMobileConfig(w, r, dnsProtoTLS)
+// handleMobileConfigDoT handles getting DNS-over-TLS .mobileconfig.
+func (m *mobileConfigHandler) handleMobileConfigDoT(w http.ResponseWriter, r *http.Request) {
+	m.handleMobileConfig(w, r, dnsProtoTLS)
 }

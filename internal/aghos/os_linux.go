@@ -1,35 +1,22 @@
-// +build linux
+//go:build linux
 
 package aghos
 
 import (
-	"bytes"
-	"io/ioutil"
+	"io"
 	"os"
-	"path/filepath"
-	"strings"
 	"syscall"
 
-	"github.com/AdguardTeam/golibs/log"
-	"golang.org/x/sys/unix"
+	"github.com/AdguardTeam/golibs/osutil"
+	"github.com/AdguardTeam/golibs/stringutil"
 )
 
-func canBindPrivilegedPorts() (can bool, err error) {
-	cnbs, err := unix.PrctlRetInt(unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_IS_SET, unix.CAP_NET_BIND_SERVICE, 0, 0)
-	// Don't check the error because it's always nil on Linux.
-	adm, _ := haveAdminRights()
-
-	return cnbs == 1 || adm, err
-}
-
-func setRlimit(val uint) {
+func setRlimit(val uint64) (err error) {
 	var rlim syscall.Rlimit
-	rlim.Max = uint64(val)
-	rlim.Cur = uint64(val)
-	err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rlim)
-	if err != nil {
-		log.Error("Setrlimit() failed: %v", err)
-	}
+	rlim.Max = val
+	rlim.Cur = val
+
+	return syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rlim)
 }
 
 func haveAdminRights() (bool, error) {
@@ -38,44 +25,23 @@ func haveAdminRights() (bool, error) {
 	return os.Getuid() == 0, nil
 }
 
-func sendProcessSignal(pid int, sig syscall.Signal) error {
-	return syscall.Kill(pid, sig)
-}
-
 func isOpenWrt() (ok bool) {
-	const etcDir = "/etc"
+	const etcReleasePattern = "etc/*release*"
 
-	// TODO(e.burkov): Take care of dealing with fs package after updating
-	// Go version to 1.16.
-	fileInfos, err := ioutil.ReadDir(etcDir)
-	if err != nil {
-		return false
-	}
+	var err error
+	ok, err = FileWalker(func(r io.Reader) (_ []string, cont bool, err error) {
+		const osNameData = "openwrt"
 
-	// fNameSubstr is a part of a name of the desired file.
-	const fNameSubstr = "release"
-	osNameData := []byte("OpenWrt")
-
-	for _, fileInfo := range fileInfos {
-		if fileInfo.IsDir() {
-			continue
-		}
-
-		fn := fileInfo.Name()
-		if !strings.Contains(fn, fNameSubstr) {
-			continue
-		}
-
-		var body []byte
-		body, err = ioutil.ReadFile(filepath.Join(etcDir, fn))
+		// This use of ReadAll is now safe, because FileWalker's Walk()
+		// have limited r.
+		var data []byte
+		data, err = io.ReadAll(r)
 		if err != nil {
-			continue
+			return nil, false, err
 		}
 
-		if bytes.Contains(body, osNameData) {
-			return true
-		}
-	}
+		return nil, !stringutil.ContainsFold(string(data), osNameData), nil
+	}).Walk(osutil.RootDirFS(), etcReleasePattern)
 
-	return false
+	return err == nil && ok
 }

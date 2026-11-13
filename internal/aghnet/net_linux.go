@@ -1,151 +1,186 @@
-// +build linux
+//go:build linux
 
 package aghnet
 
 import (
 	"bufio"
-	"errors"
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"net"
+	"log/slog"
+	"net/netip"
 	"os"
 	"strings"
 
-	"github.com/AdguardTeam/AdGuardHome/internal/aghio"
-	"github.com/google/renameio/maybe"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
+	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/osutil/executil"
+	"github.com/AdguardTeam/golibs/stringutil"
+	"github.com/google/renameio/v2/maybe"
+	"golang.org/x/sys/unix"
 )
 
-// maxConfigFileSize is the maximum length of interfaces configuration file.
-const maxConfigFileSize = 1024 * 1024
+// dhcpсdConf is the name of /etc/dhcpcd.conf file in the root filesystem.
+const dhcpcdConf = "etc/dhcpcd.conf"
 
-func ifaceHasStaticIP(ifaceName string) (has bool, err error) {
-	// TODO(a.garipov): Currently, this function returns the first
-	// definitive result.  So if /etc/dhcpcd.conf has a static IP while
-	// /etc/network/interfaces doesn't, it will return true.  Perhaps this
-	// is not the most desirable behavior.
+func canBindPrivilegedPorts(ctx context.Context, l *slog.Logger) (can bool, err error) {
+	res, err := unix.PrctlRetInt(
+		unix.PR_CAP_AMBIENT,
+		unix.PR_CAP_AMBIENT_IS_SET,
+		unix.CAP_NET_BIND_SERVICE,
+		0,
+		0,
+	)
+	if err != nil {
+		if errors.Is(err, unix.EINVAL) {
+			// Older versions of Linux kernel do not support this.  Print a
+			// warning and check admin rights.
+			l.WarnContext(
+				ctx,
+				"checking capability cap_net_bind_service",
+				slogutil.KeyError, err,
+			)
+		} else {
+			return false, err
+		}
+	}
 
-	for _, check := range []struct {
-		checker  func(io.Reader, string) (bool, error)
-		filePath string
+	// Don't check the error because it's always nil on Linux.
+	adm, _ := aghos.HaveAdminRights()
+
+	return res == 1 || adm, nil
+}
+
+// dhcpcdStaticConfig checks if interface is configured by /etc/dhcpcd.conf to
+// have a static IP.
+func (n interfaceName) dhcpcdStaticConfig(r io.Reader) (subsources []string, cont bool, err error) {
+	s := bufio.NewScanner(r)
+	if !findIfaceLine(s, string(n)) {
+		return nil, true, s.Err()
+	}
+
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		fields := strings.Fields(line)
+		if len(fields) >= 2 &&
+			fields[0] == "static" &&
+			strings.HasPrefix(fields[1], "ip_address=") {
+			return nil, false, s.Err()
+		}
+
+		if len(fields) > 0 && fields[0] == "interface" {
+			// Another interface found.
+			break
+		}
+	}
+
+	return nil, true, s.Err()
+}
+
+// ifacesStaticConfig checks if the interface is configured by any file of
+// /etc/network/interfaces format to have a static IP.
+func (n interfaceName) ifacesStaticConfig(r io.Reader) (sub []string, cont bool, err error) {
+	s := bufio.NewScanner(r)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+
+		// TODO(e.burkov): As man page interfaces(5) says, a line may be
+		// extended across multiple lines by making the last character a
+		// backslash.  Provide extended lines support.
+
+		fields := strings.Fields(line)
+		fieldsNum := len(fields)
+
+		// Man page interfaces(5) declares that interface definition should
+		// consist of the key word "iface" followed by interface name, and
+		// method at fourth field.
+		if fieldsNum >= 4 &&
+			fields[0] == "iface" && fields[1] == string(n) && fields[3] == "static" {
+			return nil, false, nil
+		}
+
+		if fieldsNum >= 2 && fields[0] == "source" {
+			sub = append(sub, fields[1])
+		}
+	}
+
+	return sub, true, s.Err()
+}
+
+func ifaceHasStaticIP(
+	_ context.Context,
+	_ executil.CommandConstructor,
+	ifaceName string,
+) (has bool, err error) {
+	// TODO(a.garipov): Currently, this function returns the first definitive
+	// result.  So if /etc/dhcpcd.conf has and /etc/network/interfaces has no
+	// static IP configuration, it will return true.  Perhaps this is not the
+	// most desirable behavior.
+
+	iface := interfaceName(ifaceName)
+
+	for _, pair := range [...]struct {
+		aghos.FileWalker
+		filename string
 	}{{
-		checker:  dhcpcdStaticConfig,
-		filePath: "/etc/dhcpcd.conf",
+		FileWalker: iface.dhcpcdStaticConfig,
+		filename:   dhcpcdConf,
 	}, {
-		checker:  ifacesStaticConfig,
-		filePath: "/etc/network/interfaces",
+		FileWalker: iface.ifacesStaticConfig,
+		filename:   "etc/network/interfaces",
 	}} {
-		var f *os.File
-		f, err = os.Open(check.filePath)
-		if err != nil {
-			// ErrNotExist can happen here if there is no such file.
-			// This is normal, as not every system uses those files.
-			if errors.Is(err, os.ErrNotExist) {
-				err = nil
-
-				continue
-			}
-
-			return false, err
-		}
-		defer f.Close()
-
-		var fileReadCloser io.ReadCloser
-		fileReadCloser, err = aghio.LimitReadCloser(f, maxConfigFileSize)
+		has, err = pair.Walk(rootDirFS, pair.filename)
 		if err != nil {
 			return false, err
+		} else if has {
+			return true, nil
 		}
-		defer fileReadCloser.Close()
-
-		has, err = check.checker(fileReadCloser, ifaceName)
-		if err != nil {
-			return false, err
-		}
-
-		return has, nil
 	}
 
 	return false, ErrNoStaticIPInfo
 }
 
-// dhcpcdStaticConfig checks if interface is configured by /etc/dhcpcd.conf to
-// have a static IP.
-func dhcpcdStaticConfig(r io.Reader, ifaceName string) (has bool, err error) {
-	s := bufio.NewScanner(r)
-	var withinInterfaceCtx bool
-
+// findIfaceLine scans s until it finds the line that declares an interface with
+// the given name.  If findIfaceLine can't find the line, it returns false.
+func findIfaceLine(s *bufio.Scanner, name string) (ok bool) {
 	for s.Scan() {
 		line := strings.TrimSpace(s.Text())
-
-		if withinInterfaceCtx && len(line) == 0 {
-			// An empty line resets our state.
-			withinInterfaceCtx = false
-		}
-
-		if len(line) == 0 || line[0] == '#' {
-			continue
-		}
-
 		fields := strings.Fields(line)
-
-		if withinInterfaceCtx {
-			if len(fields) >= 2 && fields[0] == "static" && strings.HasPrefix(fields[1], "ip_address=") {
-				return true, nil
-			}
-			if len(fields) > 0 && fields[0] == "interface" {
-				// Another interface found.
-				withinInterfaceCtx = false
-			}
-			continue
-		}
-
-		if len(fields) == 2 && fields[0] == "interface" && fields[1] == ifaceName {
-			// The interface found.
-			withinInterfaceCtx = true
+		if len(fields) == 2 && fields[0] == "interface" && fields[1] == name {
+			return true
 		}
 	}
 
-	return false, s.Err()
+	return false
 }
 
-// ifacesStaticConfig checks if interface is configured by
-// /etc/network/interfaces to have a static IP.
-func ifacesStaticConfig(r io.Reader, ifaceName string) (has bool, err error) {
-	s := bufio.NewScanner(r)
-	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-
-		if len(line) == 0 || line[0] == '#' {
-			continue
-		}
-
-		fields := strings.Fields(line)
-		// Man page interfaces(5) declares that interface definition
-		// should consist of the key word "iface" followed by interface
-		// name, and method at fourth field.
-		if len(fields) >= 4 && fields[0] == "iface" && fields[1] == ifaceName && fields[3] == "static" {
-			return true, nil
-		}
-	}
-	return false, s.Err()
-}
-
-func ifaceSetStaticIP(ifaceName string) (err error) {
-	ipNet := GetSubnet(ifaceName)
-	if ipNet.IP == nil {
-		return errors.New("can't get IP address")
+// ifaceSetStaticIP configures the system to retain its current IP on the
+// interface through dhcpcd.conf.  l and cmdCons must not be nil.
+func ifaceSetStaticIP(
+	ctx context.Context,
+	l *slog.Logger,
+	cmdCons executil.CommandConstructor,
+	ifaceName string,
+) (err error) {
+	ipNet := GetSubnet(ctx, l, ifaceName)
+	if !ipNet.Addr().IsValid() {
+		return errors.Error("can't get IP address")
 	}
 
-	gatewayIP := GatewayIP(ifaceName)
-	add := updateStaticIPdhcpcdConf(ifaceName, ipNet.String(), gatewayIP, ipNet.IP)
-
-	body, err := ioutil.ReadFile("/etc/dhcpcd.conf")
-	if err != nil {
+	body, err := os.ReadFile(dhcpcdConf)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 
+	gatewayIP := GatewayIP(ctx, l, cmdCons, ifaceName)
+	add := dhcpcdConfIface(ifaceName, ipNet, gatewayIP)
+
 	body = append(body, []byte(add)...)
-	err = maybe.WriteFile("/etc/dhcpcd.conf", body, 0o644)
+	err = maybe.WriteFile(dhcpcdConf, body, 0o644)
 	if err != nil {
 		return fmt.Errorf("writing conf: %w", err)
 	}
@@ -153,24 +188,26 @@ func ifaceSetStaticIP(ifaceName string) (err error) {
 	return nil
 }
 
-// updateStaticIPdhcpcdConf sets static IP address for the interface by writing
-// into dhcpd.conf.
-func updateStaticIPdhcpcdConf(ifaceName, ip string, gatewayIP, dnsIP net.IP) string {
-	var body []byte
+// dhcpcdConfIface returns configuration lines for the dhcpdc.conf files that
+// configure the interface to have a static IP.
+func dhcpcdConfIface(ifaceName string, subnet netip.Prefix, gateway netip.Addr) (conf string) {
+	b := &strings.Builder{}
+	stringutil.WriteToBuilder(
+		b,
+		"\n# ",
+		ifaceName,
+		" added by AdGuard Home.\ninterface ",
+		ifaceName,
+		"\nstatic ip_address=",
+		subnet.String(),
+		"\n",
+	)
 
-	add := fmt.Sprintf("\ninterface %s\nstatic ip_address=%s\n",
-		ifaceName, ip)
-	body = append(body, []byte(add)...)
-
-	if gatewayIP != nil {
-		add = fmt.Sprintf("static routers=%s\n",
-			gatewayIP)
-		body = append(body, []byte(add)...)
+	if gateway != (netip.Addr{}) {
+		stringutil.WriteToBuilder(b, "static routers=", gateway.String(), "\n")
 	}
 
-	add = fmt.Sprintf("static domain_name_servers=%s\n\n",
-		dnsIP)
-	body = append(body, []byte(add)...)
+	stringutil.WriteToBuilder(b, "static domain_name_servers=", subnet.Addr().String(), "\n\n")
 
-	return string(body)
+	return b.String()
 }

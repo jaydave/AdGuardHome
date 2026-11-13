@@ -1,23 +1,29 @@
 #!/bin/sh
 
-set -e -f -u
+# This comment is used to simplify checking local copies of the script.  Bump
+# this number every time a significant change is made to this script.
+#
+# AdGuard-Project-Version: 7
 
-if [ "$(git diff --cached --name-only -- 'client/*.js')" ]
-then
-	make js-lint js-test
+set -e -f -o 'pipefail' -u
+
+. ./scripts/hooks/helper.sh
+
+# Warn the programmer about temporary todos and skel FIXMEs, but do not fail the
+# commit, because the commit could be in a temporary branch.
+temp_todos="$(
+	git grep -e 'FIXME' -e 'TODO.*!!' -- \
+		':!./scripts/hooks/pre-commit' \
+		':!./client' \
+		|| :
+)"
+readonly temp_todos
+
+if [ "$temp_todos" != '' ]; then
+	printf 'WARNING: you have temporary todos:\n\n%s\n\n' "$temp_todos"
+	prompt
 fi
 
-if [ "$(git diff --cached --name-only -- 'client2/*.js' 'client2/*.ts' 'client2/*.tsx')" ]
-then
-	make js-beta-lint js-beta-test
-fi
+check_unstaged_changes
 
-if [ "$(git diff --cached --name-only -- '*.go' 'go.mod')" ]
-then
-	make go-os-check go-lint go-test
-fi
-
-if [ "$(git diff --cached --name-only -- './openapi/openapi.yaml')" ]
-then
-	make openapi-lint
-fi
+lint_staged_changes

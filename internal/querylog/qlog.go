@@ -2,39 +2,56 @@
 package querylog
 
 import (
-	"errors"
+	"context"
 	"fmt"
-	"net"
+	"log/slog"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/AdguardTeam/AdGuardHome/internal/dnsfilter"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
+	"github.com/AdguardTeam/AdGuardHome/internal/configmgr"
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
+	"github.com/AdguardTeam/golibs/container"
+	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/timeutil"
 	"github.com/miekg/dns"
 )
 
-const (
-	queryLogFileName = "querylog.json" // .gz added during compression
-)
+// queryLogFileName is a name of the log file.  ".gz" extension is added later
+// during compression.
+const queryLogFileName = "querylog.json"
 
-// queryLog is a structure that writes and reads the DNS query log
+// queryLog is a structure that writes and reads the DNS query log.
 type queryLog struct {
+	// logger is used for logging the operation of the query log.  It must not
+	// be nil.
+	logger *slog.Logger
+
+	// confMu protects conf.
+	confMu *sync.RWMutex
+
+	conf       *Config
+	anonymizer *aghnet.IPMut
+
 	findClient func(ids []string) (c *Client, err error)
 
-	conf    *Config
-	lock    sync.Mutex
-	logFile string // path to the log file
+	// buffer contains recent log entries.  The entries in this buffer must not
+	// be modified.
+	buffer *container.RingBuffer[*logEntry]
+
+	// logFile is the path to the log file.
+	logFile string
 
 	// bufferLock protects buffer.
 	bufferLock sync.RWMutex
-	// buffer contains recent log entries.
-	buffer []*logEntry
 
-	fileFlushLock sync.Mutex // synchronize a file-flushing goroutine and main thread
-	flushPending  bool       // don't start another goroutine while the previous one is still running
+	// fileFlushLock synchronizes a file-flushing goroutine and main thread.
+	fileFlushLock sync.Mutex
 	fileWriteLock sync.Mutex
+
+	flushPending bool
 }
 
 // ClientProto values are names of the client protocols.
@@ -42,9 +59,9 @@ type ClientProto string
 
 // Client protocol names.
 const (
-	ClientProtoDOH      ClientProto = "doh"
-	ClientProtoDOQ      ClientProto = "doq"
-	ClientProtoDOT      ClientProto = "dot"
+	ClientProtoDoH      ClientProto = "doh"
+	ClientProtoDoQ      ClientProto = "doq"
+	ClientProtoDoT      ClientProto = "dot"
 	ClientProtoDNSCrypt ClientProto = "dnscrypt"
 	ClientProtoPlain    ClientProto = ""
 )
@@ -54,9 +71,9 @@ const (
 func NewClientProto(s string) (cp ClientProto, err error) {
 	switch cp = ClientProto(s); cp {
 	case
-		ClientProtoDOH,
-		ClientProtoDOQ,
-		ClientProtoDOT,
+		ClientProtoDoH,
+		ClientProtoDoQ,
+		ClientProtoDoT,
 		ClientProtoDNSCrypt,
 		ClientProtoPlain:
 
@@ -66,151 +83,205 @@ func NewClientProto(s string) (cp ClientProto, err error) {
 	}
 }
 
-// logEntry - represents a single log entry
-type logEntry struct {
-	// client is the found client information, if any.
-	client *Client
+// type check
+var _ QueryLog = (*queryLog)(nil)
 
-	IP   net.IP    `json:"IP"` // Client IP
-	Time time.Time `json:"T"`
-
-	QHost  string `json:"QH"`
-	QType  string `json:"QT"`
-	QClass string `json:"QC"`
-
-	ClientID    string      `json:"CID,omitempty"`
-	ClientProto ClientProto `json:"CP"`
-
-	Answer     []byte `json:",omitempty"` // sometimes empty answers happen like binerdunt.top or rev2.globalrootservers.net
-	OrigAnswer []byte `json:",omitempty"`
-
-	Result   dnsfilter.Result
-	Elapsed  time.Duration
-	Upstream string `json:",omitempty"` // if empty, means it was cached
-}
-
-func (l *queryLog) Start() {
-	if l.conf.HTTPRegister != nil {
+// Start implements the [QueryLog] interface for *queryLog.
+func (l *queryLog) Start(ctx context.Context) (err error) {
+	if l.conf.HTTPReg != nil {
 		l.initWeb()
 	}
-	go l.periodicRotate()
+
+	go l.periodicRotate(ctx)
+
+	return nil
 }
 
-func (l *queryLog) Close() {
-	_ = l.flushLogBuffer(true)
+// Shutdown implements the [QueryLog] interface for *queryLog.
+func (l *queryLog) Shutdown(ctx context.Context) (err error) {
+	l.confMu.RLock()
+	defer l.confMu.RUnlock()
+
+	if l.conf.FileEnabled {
+		err = l.flushLogBuffer(ctx)
+		if err != nil {
+			// Don't wrap the error because it's informative enough as is.
+			return err
+		}
+	}
+
+	return nil
 }
 
-func checkInterval(days uint32) bool {
-	return days == 1 || days == 7 || days == 30 || days == 90
+// validateIvl returns an error if ivl is less than an hour or more than a
+// year.
+func validateIvl(ivl time.Duration) (err error) {
+	if ivl < time.Hour {
+		return errors.Error("less than an hour")
+	}
+
+	if ivl > timeutil.Day*365 {
+		return errors.Error("more than a year")
+	}
+
+	return nil
 }
 
-func (l *queryLog) WriteDiskConfig(c *Config) {
-	*c = *l.conf
+// WriteDiskConfig implements the [QueryLog] interface for *queryLog.
+func (l *queryLog) WriteDiskConfig(dc *configmgr.QueryLogConfig, dnsConf *configmgr.DNSConfig) {
+	l.confMu.RLock()
+	defer l.confMu.RUnlock()
+
+	c := l.conf
+
+	dc.Ignored = c.Ignored.Values()
+	dc.Interval = timeutil.Duration(c.RotationIvl)
+	dc.MemSize = c.MemSize
+	dc.Enabled = c.Enabled
+	dc.FileEnabled = c.FileEnabled
+	dc.IgnoredEnabled = c.Ignored.IsEnabled()
+
+	dnsConf.AnonymizeClientIP = c.AnonymizeClientIP
 }
 
 // Clear memory buffer and remove log files
-func (l *queryLog) clear() {
+func (l *queryLog) clear(ctx context.Context) {
 	l.fileFlushLock.Lock()
 	defer l.fileFlushLock.Unlock()
 
-	l.bufferLock.Lock()
-	l.buffer = nil
-	l.flushPending = false
-	l.bufferLock.Unlock()
+	func() {
+		l.bufferLock.Lock()
+		defer l.bufferLock.Unlock()
+
+		l.buffer.Clear()
+		l.flushPending = false
+	}()
 
 	oldLogFile := l.logFile + ".1"
 	err := os.Remove(oldLogFile)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Error("removing old log file %q: %s", oldLogFile, err)
+		l.logger.ErrorContext(
+			ctx,
+			"removing old log file",
+			"file", oldLogFile,
+			slogutil.KeyError, err,
+		)
 	}
 
 	err = os.Remove(l.logFile)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Error("removing log file %q: %s", l.logFile, err)
+		l.logger.ErrorContext(ctx, "removing log file", "file", l.logFile, slogutil.KeyError, err)
 	}
 
-	log.Debug("Query log: cleared")
+	l.logger.DebugContext(ctx, "cleared")
 }
 
-func (l *queryLog) Add(params AddParams) {
-	var err error
+// newLogEntry creates an instance of logEntry from parameters.
+func newLogEntry(ctx context.Context, logger *slog.Logger, params *AddParams) (entry *logEntry) {
+	q := params.Question.Question[0]
+	qHost := aghnet.NormalizeDomain(q.Name)
 
-	if !l.conf.Enabled {
+	entry = &logEntry{
+		// TODO(d.kolyshev): Export this timestamp to func params.
+		Time:   time.Now(),
+		QHost:  qHost,
+		QType:  dns.Type(q.Qtype).String(),
+		QClass: dns.Class(q.Qclass).String(),
+
+		ClientID:    params.ClientID,
+		ClientProto: params.ClientProto,
+
+		Result:   *params.Result,
+		Upstream: params.Upstream,
+
+		IP: params.ClientIP,
+
+		Elapsed: params.Elapsed,
+
+		Cached:            params.Cached,
+		AuthenticatedData: params.AuthenticatedData,
+	}
+
+	if params.ReqECS != nil {
+		entry.ReqECS = params.ReqECS.String()
+	}
+
+	entry.addResponse(ctx, logger, params.Answer, false)
+	entry.addResponse(ctx, logger, params.OrigAnswer, true)
+
+	return entry
+}
+
+// Add implements the [QueryLog] interface for *queryLog.
+func (l *queryLog) Add(params *AddParams) {
+	var isEnabled, fileIsEnabled bool
+	var memSize uint
+	func() {
+		l.confMu.RLock()
+		defer l.confMu.RUnlock()
+
+		isEnabled, fileIsEnabled = l.conf.Enabled, l.conf.FileEnabled
+		memSize = l.conf.MemSize
+	}()
+
+	if !isEnabled {
 		return
 	}
 
-	err = params.validate()
+	// TODO(s.chzhen):  Pass context.
+	ctx := context.TODO()
+
+	err := params.validate()
 	if err != nil {
-		log.Error("querylog: adding record: %s, skipping", err)
+		l.logger.ErrorContext(ctx, "adding record", slogutil.KeyError, err)
 
 		return
 	}
 
 	if params.Result == nil {
-		params.Result = &dnsfilter.Result{}
+		params.Result = &filtering.Result{}
 	}
 
-	now := time.Now()
-	entry := logEntry{
-		IP:   l.getClientIP(params.ClientIP),
-		Time: now,
-
-		Result:      *params.Result,
-		Elapsed:     params.Elapsed,
-		Upstream:    params.Upstream,
-		ClientID:    params.ClientID,
-		ClientProto: params.ClientProto,
-	}
-	q := params.Question.Question[0]
-	entry.QHost = strings.ToLower(q.Name[:len(q.Name)-1]) // remove the last dot
-	entry.QType = dns.Type(q.Qtype).String()
-	entry.QClass = dns.Class(q.Qclass).String()
-
-	if params.Answer != nil {
-		var a []byte
-		a, err = params.Answer.Pack()
-		if err != nil {
-			log.Error("querylog: Answer.Pack(): %s", err)
-
-			return
-		}
-
-		entry.Answer = a
-	}
-
-	if params.OrigAnswer != nil {
-		var a []byte
-		a, err = params.OrigAnswer.Pack()
-		if err != nil {
-			log.Error("querylog: OrigAnswer.Pack(): %s", err)
-
-			return
-		}
-
-		entry.OrigAnswer = a
-	}
+	entry := newLogEntry(ctx, l.logger, params)
 
 	l.bufferLock.Lock()
-	l.buffer = append(l.buffer, &entry)
-	needFlush := false
+	defer l.bufferLock.Unlock()
 
-	if !l.conf.FileEnabled {
-		if len(l.buffer) > int(l.conf.MemSize) {
-			// writing to file is disabled - just remove the oldest entry from array
-			l.buffer = l.buffer[1:]
-		}
-	} else if !l.flushPending {
-		needFlush = len(l.buffer) >= int(l.conf.MemSize)
-		if needFlush {
-			l.flushPending = true
-		}
-	}
-	l.bufferLock.Unlock()
+	l.buffer.Push(entry)
 
-	// if buffer needs to be flushed to disk, do it now
-	if needFlush {
+	if !l.flushPending && fileIsEnabled && l.buffer.Len() >= memSize {
+		l.flushPending = true
+
+		// TODO(s.chzhen):  Fix occasional rewrite of entires.
 		go func() {
-			_ = l.flushLogBuffer(false)
+			flushErr := l.flushLogBuffer(ctx)
+			if flushErr != nil {
+				l.logger.ErrorContext(ctx, "flushing after adding", slogutil.KeyError, flushErr)
+			}
 		}()
 	}
+}
+
+// ShouldLog returns true if request for the host should be logged.
+func (l *queryLog) ShouldLog(host string, _, _ uint16, ids []string) bool {
+	l.confMu.RLock()
+	defer l.confMu.RUnlock()
+
+	c, err := l.findClient(ids)
+	if err != nil {
+		// TODO(s.chzhen):  Pass context.
+		l.logger.ErrorContext(context.TODO(), "finding client", slogutil.KeyError, err)
+	}
+
+	if c != nil && c.IgnoreQueryLog {
+		return false
+	}
+
+	return !l.isIgnored(host)
+}
+
+// isIgnored returns true if the host is in the ignored domains list.  It
+// assumes that l.confMu is locked for reading.
+func (l *queryLog) isIgnored(host string) bool {
+	return l.conf.Ignored.Has(host)
 }

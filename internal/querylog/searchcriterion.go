@@ -1,126 +1,160 @@
 package querylog
 
 import (
+	"context"
+	"log/slog"
+	"slices"
 	"strings"
 
-	"github.com/AdguardTeam/AdGuardHome/internal/dnsfilter"
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
+	"github.com/AdguardTeam/golibs/stringutil"
 )
 
 type criterionType int
 
 const (
-	// ctDomainOrClient is for searching by the domain name, the client's IP
-	// address, or the clinet's ID.
-	ctDomainOrClient criterionType = iota
-	// ctFilteringStatus is for searching by the filtering status.
-	//
-	// See (*searchCriterion).ctFilteringStatusCase for details.
-	ctFilteringStatus
+	// ctTerm is for searching by the domain name, the client's IP address, the
+	// client's ID or the client's name.  The domain name search supports IDNAs.
+	ctTerm criterionType = iota
+
+	// ctReason is for searching by the filtering reason.
+	ctReason
 )
 
-const (
-	filteringStatusAll      = "all"
-	filteringStatusFiltered = "filtered" // all kinds of filtering
-
-	filteringStatusBlocked             = "blocked"              // blocked or blocked services
-	filteringStatusBlockedService      = "blocked_services"     // blocked
-	filteringStatusBlockedSafebrowsing = "blocked_safebrowsing" // blocked by safebrowsing
-	filteringStatusBlockedParental     = "blocked_parental"     // blocked by parental control
-	filteringStatusWhitelisted         = "whitelisted"          // whitelisted
-	filteringStatusRewritten           = "rewritten"            // all kinds of rewrites
-	filteringStatusSafeSearch          = "safe_search"          // enforced safe search
-	filteringStatusProcessed           = "processed"            // not blocked, not white-listed entries
-)
-
-// filteringStatusValues -- array with all possible filteringStatus values
-var filteringStatusValues = []string{
-	filteringStatusAll, filteringStatusFiltered, filteringStatusBlocked,
-	filteringStatusBlockedService, filteringStatusBlockedSafebrowsing, filteringStatusBlockedParental,
-	filteringStatusWhitelisted, filteringStatusRewritten, filteringStatusSafeSearch,
-	filteringStatusProcessed,
+// reasonCodes is a set of all valid reason codes.
+var reasonCodes = [...]string{
+	filtering.NotFilteredAllowList:   "1",
+	filtering.NotFilteredError:       "2",
+	filtering.FilteredBlockList:      "3",
+	filtering.FilteredSafeBrowsing:   "4",
+	filtering.FilteredParental:       "5",
+	filtering.FilteredInvalid:        "6",
+	filtering.FilteredSafeSearch:     "7",
+	filtering.FilteredBlockedService: "8",
+	filtering.Rewritten:              "9",
+	filtering.RewrittenAutoHosts:     "10",
+	filtering.RewrittenRule:          "11",
 }
 
 // searchCriterion is a search criterion that is used to match a record.
 type searchCriterion struct {
-	value         string
+	// value is the target value for searching.  If
+	// [searchCriterion.criterionType] is [ctTerm] or [ctFilteringStatus] value
+	// must not be empty.
+	value string
+
+	// asciiVal is the ASCII representation of value for matching IDNA domain
+	// names.  It is used by [ctTerm].
+	asciiVal string
+
+	// values is a list of target values for searching.  It is used by
+	// [ctReason] type.
+	values []string
+
+	// criterionType is the type of search criterion.  It must be one of:
+	//	- [ctTerm]
+	//	- [ctFilteringStatus]
+	//	- [ctReason]
 	criterionType criterionType
-	// strict, if true, means that the criterion must be applied to the
-	// whole value rather than the part of it.  That is, equality and not
-	// containment.
+
+	// strict, if true, means that the criterion must be applied to the whole
+	// value rather than the part of it.  That is, equality and not containment.
+	// It is used by [ctTerm].
 	strict bool
 }
 
-func (c *searchCriterion) ctDomainOrClientCaseStrict(
+func ctDomainOrClientCaseStrict(
 	term string,
+	asciiTerm string,
 	clientID string,
 	name string,
 	host string,
 	ip string,
 ) (ok bool) {
 	return strings.EqualFold(host, term) ||
+		(asciiTerm != "" && strings.EqualFold(host, asciiTerm)) ||
 		strings.EqualFold(clientID, term) ||
 		strings.EqualFold(ip, term) ||
 		strings.EqualFold(name, term)
 }
 
-func (c *searchCriterion) ctDomainOrClientCaseNonStrict(
+func ctDomainOrClientCaseNonStrict(
 	term string,
+	asciiTerm string,
 	clientID string,
 	name string,
 	host string,
 	ip string,
 ) (ok bool) {
-	// TODO(a.garipov): Write a performant, case-insensitive version of
-	// strings.Contains instead of generating garbage.  Or, perhaps in the
-	// future, use a locale-appropriate matcher from golang.org/x/text.
-	clientID = strings.ToLower(clientID)
-	host = strings.ToLower(host)
-	ip = strings.ToLower(ip)
-	name = strings.ToLower(name)
-	term = strings.ToLower(term)
-
-	return strings.Contains(clientID, term) ||
-		strings.Contains(host, term) ||
-		strings.Contains(ip, term) ||
-		strings.Contains(name, term)
+	return stringutil.ContainsFold(clientID, term) ||
+		stringutil.ContainsFold(host, term) ||
+		(asciiTerm != "" && stringutil.ContainsFold(host, asciiTerm)) ||
+		stringutil.ContainsFold(ip, term) ||
+		stringutil.ContainsFold(name, term)
 }
 
 // quickMatch quickly checks if the line matches the given search criterion.
 // It returns false if the like doesn't match.  This method is only here for
-// optimisation purposes.
-func (c *searchCriterion) quickMatch(line string, findClient quickMatchClientFunc) (ok bool) {
+// optimization purposes.  logger and findClient must not be nil.
+func (c *searchCriterion) quickMatch(
+	ctx context.Context,
+	logger *slog.Logger,
+	line string,
+	findClient quickMatchClientFunc,
+) (ok bool) {
 	switch c.criterionType {
-	case ctDomainOrClient:
+	case ctTerm:
 		host := readJSONValue(line, `"QH":"`)
 		ip := readJSONValue(line, `"IP":"`)
 		clientID := readJSONValue(line, `"CID":"`)
 
 		var name string
-		if cli := findClient(clientID, ip); cli != nil {
+		if cli := findClient(ctx, logger, clientID, ip); cli != nil {
 			name = cli.Name
 		}
 
 		if c.strict {
-			return c.ctDomainOrClientCaseStrict(c.value, clientID, name, host, ip)
+			return ctDomainOrClientCaseStrict(c.value, c.asciiVal, clientID, name, host, ip)
 		}
 
-		return c.ctDomainOrClientCaseNonStrict(c.value, clientID, name, host, ip)
+		return ctDomainOrClientCaseNonStrict(c.value, c.asciiVal, clientID, name, host, ip)
 	case ctFilteringStatus:
 		// Go on, as we currently don't do quick matches against
 		// filtering statuses.
+		//
+		// TODO(a.garipov):  Remove once the old frontend is completely gone.
 		return true
+	case ctReason:
+		reasonCode := readJSONNumericValue(line, `"Reason":`)
+		if reasonCode == "" {
+			// For [filtering.NotFilteredNotFound] reason can be empty.
+			return slices.Contains(c.values, filtering.NotFilteredNotFound.String())
+		}
+
+		idx := slices.Index(reasonCodes[:], reasonCode)
+		if idx == -1 {
+			return false
+		}
+
+		return slices.Contains(c.values, filtering.Reason(idx).String())
 	default:
 		return true
 	}
 }
 
-// match checks if the log entry matches this search criterion.
+// match checks if the log entry matches this search criterion.  entry must not
+// be nil.
 func (c *searchCriterion) match(entry *logEntry) bool {
 	switch c.criterionType {
-	case ctDomainOrClient:
+	case ctTerm:
 		return c.ctDomainOrClientCase(entry)
+	case ctReason:
+		// TODO(f.setrakov): Consider comparing [filtering.Reason] instead of
+		// strings.
+		return slices.Contains(c.values, entry.Result.Reason.String())
 	case ctFilteringStatus:
-		return c.ctFilteringStatusCase(entry.Result)
+		// TODO(a.garipov):  Remove once the old frontend is completely gone.
+		return c.ctFilteringStatusCase(entry.Result.Reason, entry.Result.IsFiltered)
 	}
 
 	return false
@@ -136,62 +170,9 @@ func (c *searchCriterion) ctDomainOrClientCase(e *logEntry) bool {
 	}
 
 	ip := e.IP.String()
-	term := strings.ToLower(c.value)
 	if c.strict {
-		return c.ctDomainOrClientCaseStrict(term, clientID, name, host, ip)
+		return ctDomainOrClientCaseStrict(c.value, c.asciiVal, clientID, name, host, ip)
 	}
 
-	return c.ctDomainOrClientCaseNonStrict(term, clientID, name, host, ip)
-}
-
-func (c *searchCriterion) ctFilteringStatusCase(res dnsfilter.Result) bool {
-	switch c.value {
-	case filteringStatusAll:
-		return true
-
-	case filteringStatusFiltered:
-		return res.IsFiltered ||
-			res.Reason.In(
-				dnsfilter.NotFilteredAllowList,
-				dnsfilter.Rewritten,
-				dnsfilter.RewrittenAutoHosts,
-				dnsfilter.RewrittenRule,
-			)
-
-	case filteringStatusBlocked:
-		return res.IsFiltered &&
-			res.Reason.In(dnsfilter.FilteredBlockList, dnsfilter.FilteredBlockedService)
-
-	case filteringStatusBlockedService:
-		return res.IsFiltered && res.Reason == dnsfilter.FilteredBlockedService
-
-	case filteringStatusBlockedParental:
-		return res.IsFiltered && res.Reason == dnsfilter.FilteredParental
-
-	case filteringStatusBlockedSafebrowsing:
-		return res.IsFiltered && res.Reason == dnsfilter.FilteredSafeBrowsing
-
-	case filteringStatusWhitelisted:
-		return res.Reason == dnsfilter.NotFilteredAllowList
-
-	case filteringStatusRewritten:
-		return res.Reason.In(
-			dnsfilter.Rewritten,
-			dnsfilter.RewrittenAutoHosts,
-			dnsfilter.RewrittenRule,
-		)
-
-	case filteringStatusSafeSearch:
-		return res.IsFiltered && res.Reason == dnsfilter.FilteredSafeSearch
-
-	case filteringStatusProcessed:
-		return !res.Reason.In(
-			dnsfilter.FilteredBlockList,
-			dnsfilter.FilteredBlockedService,
-			dnsfilter.NotFilteredAllowList,
-		)
-
-	default:
-		return false
-	}
+	return ctDomainOrClientCaseNonStrict(c.value, c.asciiVal, clientID, name, host, ip)
 }
